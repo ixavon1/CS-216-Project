@@ -1,20 +1,33 @@
 import time
 import random
+import re
 import pandas as pd
+from datetime import datetime
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 
-COUNTRIES = ["US", "GB", "DE", "FR", "AU"]
+# ─────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────
+
+COUNTRIES = ["AT", "BE", "CO", "DE", "HU", "IT", "ES", "SE", "US"]
+
 SEARCH_TERMS = {
     "pro_immigration": [
         "welcome refugees", "immigration reform", "path to citizenship",
-        "dreamers", "open borders", "immigrant rights"
+        "dreamers", "open borders", "immigrant rights", "refugee resettlement",
+        "we are all immigrants"
     ],
     "anti_immigration": [
         "secure the border", "illegal immigration", "deportation",
-        "border wall", "immigration enforcement", "stop illegal"
+        "border wall", "immigration enforcement", "stop illegal",
+        "mass deportation", "build the wall"
     ]
 }
+
+# ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
 
 def human_delay(min=1.5, max=4.0):
     time.sleep(random.uniform(min, max))
@@ -23,6 +36,51 @@ def scroll_page(page, scrolls=5):
     for _ in range(scrolls):
         page.evaluate("window.scrollBy(0, window.innerHeight * 0.8)")
         human_delay(1, 2.5)
+
+def extract_page_name(card):
+    try:
+        return card.find("a", {"role": "link"}).get_text(strip=True)
+    except:
+        return None
+
+def extract_spend(card):
+    try:
+        text = card.get_text(" ", strip=True)
+        match = re.search(
+            r'Amount spent[^:]*:\s*([A-Z$€£₹]*[\$€£]?[\d,\.]+[KM]?\s*[-–]\s*[A-Z$€£₹]*[\$€£]?[\d,\.]+[KM]?)',
+            text
+        )
+        if match:
+            return match.group(1).strip()
+    except:
+        pass
+    return None
+
+def estimate_midpoint(spend_range: str):
+    """Convert a spend range like '$1,000 - $1,999' to its midpoint 1499.5."""
+    if not spend_range or pd.isna(spend_range):
+        return None
+    parts = re.split(r'\s*[-–]\s*', spend_range.strip())
+    if len(parts) != 2:
+        return None
+    def to_float(s):
+        s = re.sub(r'[A-Z]?\$|€|£|₹|\s', '', s.strip())
+        multiplier = 1
+        if s and s[-1].upper() in {"K": 1_000, "M": 1_000_000}:
+            multiplier = {"K": 1_000, "M": 1_000_000}[s[-1].upper()]
+            s = s[:-1]
+        try:
+            return float(s.replace(",", "")) * multiplier
+        except:
+            return None
+    low, high = to_float(parts[0]), to_float(parts[1])
+    if low is None or high is None:
+        return None
+    return (low + high) / 2
+
+# ─────────────────────────────────────────────
+# SCRAPER
+# ─────────────────────────────────────────────
 
 def scrape_ad_library(country: str, search_term: str, label: str):
     ads = []
@@ -35,7 +93,7 @@ def scrape_ad_library(country: str, search_term: str, label: str):
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=False,  # keep visible to avoid detection
+            headless=False,
             args=["--disable-blink-features=AutomationControlled"]
         )
         context = browser.new_context(
@@ -45,115 +103,108 @@ def scrape_ad_library(country: str, search_term: str, label: str):
             viewport={"width": 1280, "height": 800}
         )
         page = context.new_page()
+        page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+        )
 
-        # Remove webdriver fingerprint
-        page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        """)
-
-        page.goto(url, wait_until="domcontentloaded")
-        human_delay(3, 5)
-
-        # Dismiss cookie/login prompts if they appear
         try:
-            page.click('[aria-label="Close"]', timeout=3000)
-        except:
-            pass
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            human_delay(3, 5)
 
-        # Scroll to load more ads
-        scroll_page(page, scrolls=8)
+            # Dismiss prompts
+            try:
+                page.click('[aria-label="Close"]', timeout=3000)
+            except:
+                pass
 
-        # Parse the loaded content
-        soup = BeautifulSoup(page.content(), "html.parser")
-        ad_cards = soup.find_all("div", {"class": lambda c: c and "xh8yej3" in c})
+            scroll_page(page, scrolls=5)
 
-        for card in ad_cards:
-            ad_data = {
-                "country": country,
-                "search_term": search_term,
-                "label": label,  # pro_immigration or anti_immigration
-                "page_name": extract_page_name(card),
-                "ad_text": extract_ad_text(card),
-                "start_date": extract_date(card),
-                "spend_estimate": extract_spend(card),
-                "impressions": extract_impressions(card),
-            }
-            ads.append(ad_data)
+            soup = BeautifulSoup(page.content(), "html.parser")
 
-        browser.close()
+            # Select cards by content rather than fragile class names
+            all_divs = soup.find_all("div")
+            ad_cards = [
+                d for d in all_divs
+                if d.find(string=re.compile(r'Paid for by|Amount spent|Started running', re.I))
+                and len(d.get_text(strip=True)) > 80
+            ]
+
+            # Deduplicate cards by text fingerprint before parsing
+            seen = set()
+            unique_cards = []
+            for card in ad_cards:
+                fingerprint = card.get_text(strip=True)[:120]
+                if fingerprint not in seen:
+                    seen.add(fingerprint)
+                    unique_cards.append(card)
+
+            for card in unique_cards:
+                page_name   = extract_page_name(card)
+                spend_range = extract_spend(card)
+
+                # Skip cards with nothing useful
+                if not page_name and not spend_range:
+                    continue
+
+                ads.append({
+                    "country":       country,
+                    "search_term":   search_term,
+                    "label":         label,
+                    "page_name":     page_name,
+                    "spend_range":   spend_range,
+                    "spend_midpoint": estimate_midpoint(spend_range),
+                })
+
+        except Exception as e:
+            print(f"  ✗ Error [{country}] '{search_term}': {e}")
+        finally:
+            browser.close()
 
     return ads
 
+# ─────────────────────────────────────────────
+# MAIN RUN
+# ─────────────────────────────────────────────
 
-def extract_page_name(card):
-    try:
-        return card.find("a", {"role": "link"}).get_text(strip=True)
-    except:
-        return None
-
-def extract_ad_text(card):
-    try:
-        # Ad body text is usually in a span inside the card
-        spans = card.find_all("span")
-        texts = [s.get_text(strip=True) for s in spans if len(s.get_text(strip=True)) > 30]
-        return " | ".join(texts[:3])  # take first few substantial text blocks
-    except:
-        return None
-
-def extract_date(card):
-    try:
-        date_div = card.find("div", string=lambda t: t and "Started running" in t)
-        return date_div.get_text(strip=True) if date_div else None
-    except:
-        return None
-
-def extract_spend(card):
-    try:
-        spend_div = card.find("div", string=lambda t: t and "$" in str(t))
-        return spend_div.get_text(strip=True) if spend_div else None
-    except:
-        return None
-
-def extract_impressions(card):
-    try:
-        imp_div = card.find("div", string=lambda t: t and "impression" in str(t).lower())
-        return imp_div.get_text(strip=True) if imp_div else None
-    except:
-        return None
-
-
-def run_scrape(countries=COUNTRIES, terms=SEARCH_TERMS):
+def run_scrape(countries=COUNTRIES, terms=SEARCH_TERMS, output_file="immigration_ads.csv"):
     all_ads = []
 
     for country in countries:
         for label, term_list in terms.items():
             for term in term_list:
-                print(f"Scraping: [{country}] [{label}] '{term}'")
+                print(f"→ [{country}] [{label}] '{term}'")
                 try:
                     ads = scrape_ad_library(country, term, label)
                     all_ads.extend(ads)
-                    print(f"  → {len(ads)} ads found")
+                    print(f"  ✓ {len(ads)} ads found")
                 except Exception as e:
-                    print(f"  → Failed: {e}")
-
-                # Longer delay between searches to avoid rate limiting
+                    print(f"  ✗ Failed: {e}")
                 human_delay(5, 12)
 
+        # Save after each country so a crash doesn't lose everything
+        pd.DataFrame(all_ads).to_csv(output_file, index=False, encoding="utf-8-sig")
+        print(f"  ✓ Progress saved after {country}")
+
     df = pd.DataFrame(all_ads)
-    df.to_csv("immigration_ads.csv", index=False)
-    print(f"\nDone. {len(all_ads)} total ads saved.")
+
+    # Dataframe-level deduplication
+    df["raw_capture_count"] = df.groupby(
+        ["country", "label", "page_name"]
+    )["page_name"].transform("count")
+    df.drop_duplicates(subset=["country", "label", "page_name", "spend_range"], inplace=True)
+    df.dropna(subset=["page_name", "spend_range"], how="all", inplace=True)
+
+    df.to_csv(output_file, index=False, encoding="utf-8-sig")
+    print(f"\n✓ Done. {len(df)} ads saved to '{output_file}'")
+
+    # Summary
+    print("\n── Ad counts per country and stance ────────────────")
+    print(df.groupby(["country", "label"]).size().unstack(fill_value=0).to_string())
+    print("\n── Total estimated spend per country and stance ────")
+    print(df.groupby(["country", "label"])["spend_midpoint"].sum().unstack(fill_value=0).round(2).to_string())
+
     return df
 
-df = run_scrape()
 
-from transformers import pipeline
-
-classifier = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
-
-def classify_ad(text):
-    if not text:
-        return None
-    result = classifier(text, ["pro-immigration", "anti-immigration", "neutral"])
-    return result["labels"][0]
-
-df["nlp_label"] = df["ad_text"].apply(classify_ad)
+if __name__ == "__main__":
+    df = run_scrape()
